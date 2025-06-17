@@ -2,8 +2,8 @@
 
 import argparse
 import ee
-from landsatndvi.gee_interface import initialize_gee
-from landsatndvi.ndvi import get_ndvi
+from geometrics.gee_interface import initialize_gee
+from geometrics.landsatndvi.ndvi import get_ndvi
 
 def main():
     parser = argparse.ArgumentParser(
@@ -41,7 +41,12 @@ def main():
     ]
     poly = ee.Geometry.Polygon([coords])
 
-    result = get_ndvi(poly, args.start_date, args.end_date)
+    feature = ee.Feature(poly, {
+        'start_date': args.start_date,
+        'end_date': args.end_date
+    })
+
+    result = get_ndvi(feature)
 
     print("NDVI Result for Polygon:")
     print(result.getInfo())

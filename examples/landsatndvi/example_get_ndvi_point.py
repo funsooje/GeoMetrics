@@ -1,8 +1,8 @@
 # examples/example_get_ndvi_point.py
 
 import argparse
-from landsatndvi.gee_interface import initialize_gee
-from landsatndvi.ndvi import get_ndvi
+from geometrics.gee_interface import initialize_gee
+from geometrics.landsatndvi.ndvi import get_ndvi
 import ee
 
 def main():
@@ -45,8 +45,12 @@ def main():
     initialize_gee(project=args.project)
 
     point = ee.Geometry.Point([args.lon, args.lat])
+    feature = ee.Feature(point, {
+        'start_date': args.start_date,
+        'end_date': args.end_date
+    })
 
-    result = get_ndvi(point, args.start_date, args.end_date)
+    result = get_ndvi(feature)
 
     print("NDVI Result:")
     print(result.getInfo())

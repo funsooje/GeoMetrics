@@ -1,5 +1,6 @@
-from .gee_interface import initialize_gee
 import ee
+from geometrics.utils.batch_submitter import submit_feature_batches
+
 
 def qaMask(image, cloud_threshold=2, cloudshadow_threshold=2, snow_threshold=2):
     qa = image.select('QA_PIXEL')
@@ -117,14 +118,10 @@ def getImageCollection(feature,
     
     return mergedCollection
 
-def get_ndvi(point, start_date, end_date):
-    
-    geometry = point
-
-    feature = ee.Feature(geometry, {'start_date': start_date, 'end_date': end_date})
-
+def get_ndvi(feature):
     def process_image(img):
-
+        geometry = feature.geometry()
+        
         combined_reducer = ee.Reducer.mean().combine(
             reducer2=ee.Reducer.sum(),
             sharedInputs=True
@@ -163,4 +160,30 @@ def get_ndvi(point, start_date, end_date):
 
     return ee.Feature(None, result_feature.toDictionary())
     
+def submit_ndvi_batches(
+    feature_list,
+    year,
+    count_per_batch=1000,
+    task_name='ndvi_batch',
+    start_at=0,
+    stop_at=None,
+    missing_numbers=None
+):
+    def enrich_feature(feature):
+        start_date = f"{year}-01-01"
+        end_date = f"{year}-12-31"
+        return get_ndvi(
+            feature.set('year', year)
+                   .set('start_date', start_date)
+                   .set('end_date', end_date)
+        )
 
+    submit_feature_batches(
+        feature_list=feature_list,
+        enrich_function=enrich_feature,
+        task_name=task_name,
+        count_per_batch=count_per_batch,
+        start_at=start_at,
+        stop_at=stop_at,
+        missing_numbers=missing_numbers
+    )

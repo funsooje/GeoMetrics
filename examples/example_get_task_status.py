@@ -1,14 +1,14 @@
 # examples/example_get_task_status.py
 
 import argparse
-from landsatndvi.gee_interface import initialize_gee, getTaskStatus
+from geometrics.gee_interface import initialize_gee, getTaskStatus
 
 def main():
     parser = argparse.ArgumentParser(
         description="Test getTaskStatus function from the LandsatNDVI package."
     )
     parser.add_argument(
-        "--project",
+            "--project",
         type=str,
         required=True,
         help="The GEE project ID."

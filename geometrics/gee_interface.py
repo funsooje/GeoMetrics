@@ -30,6 +30,12 @@ def getTaskStatus():
         tasks_df (pd.DataFrame): DataFrame containing task details.
     """
     tasks = ee.data.listOperations()
+
+    # return empty if no tasks are found
+    if not tasks:
+        print("No tasks found.")
+        return pd.DataFrame(columns=['name', 'description', 'state', 'createTime'])
+
     tasks_list = []
     for task in tasks:
         metadata = task.get('metadata', {})

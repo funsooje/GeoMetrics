@@ -2,7 +2,7 @@
 
 import argparse
 import ee
-from landsatndvi.gee_interface import initialize_gee, submitTask
+from geometrics.gee_interface import initialize_gee, submitTask
 
 def main():
     parser = argparse.ArgumentParser(
