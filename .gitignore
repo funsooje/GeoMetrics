@@ -22,6 +22,8 @@ test*.ipynb
 plan.md
 hiergp_recommendations.md
 
-# Data files
-*.csv
+# Data files (root-level only)
+/*.csv
 archive/
+examples/
+tests/
