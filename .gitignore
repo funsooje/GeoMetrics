@@ -1,7 +1,27 @@
-# Ignore egg-info metadata
-*.egg-info/
-*.egg-info
-
-# Ignore Python cache files
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Environments
+.env
+*.env
+
+# Jupyter
+.ipynb_checkpoints/
+test*.ipynb
+*\ copy.ipynb
+
+# Local config and tooling
+.claude/
+
+# Internal working docs
+plan.md
+hiergp_recommendations.md
+
+# Data files
+*.csv
+archive/
