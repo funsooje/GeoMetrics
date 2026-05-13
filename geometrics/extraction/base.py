@@ -35,7 +35,7 @@ def ensure_source(
         ).fetchone()
 
     if row:
-        return row.source_id
+        return row.source_id, False
 
     with engine.begin() as conn:
         result = conn.execute(sources.insert().values(
@@ -52,7 +52,7 @@ def ensure_source(
                 name=var["name"],
                 unit=var.get("unit"),
             ))
-    return source_id
+    return source_id, True
 
 
 def items_to_ee_feature_collection(backend: GridBackend, items: list[dict]):

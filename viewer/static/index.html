@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GeoMetrics Viewer</title>
+  <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <aside id="sidebar">
+    <div id="sidebar-header">
+      <span class="logo">⬡</span>
+      <h1>GeoMetrics</h1>
+    </div>
+
+    <div class="control-group">
+      <label for="source-select">Source</label>
+      <select id="source-select">
+        <option value="">Loading…</option>
+      </select>
+    </div>
+
+    <div class="control-group">
+      <label for="variable-select">Variable</label>
+      <select id="variable-select" disabled>
+        <option value="">—</option>
+      </select>
+    </div>
+
+    <div class="control-group">
+      <label>Year</label>
+      <div id="year-buttons"></div>
+    </div>
+
+    <div class="control-group">
+      <label for="colormap-select">Colors</label>
+      <select id="colormap-select">
+        <option value="viridis">Viridis</option>
+        <option value="greens">Greens (vegetation)</option>
+        <option value="rdylgn">Red → Green (NDVI)</option>
+        <option value="blues">Blues (water)</option>
+        <option value="plasma">Plasma</option>
+        <option value="inferno">Inferno</option>
+        <option value="magma">Magma</option>
+        <option value="ylorrd">Yellow → Red (heat)</option>
+        <option value="spectral">Spectral (diverging)</option>
+        <option value="cividis">Cividis (colorblind-safe)</option>
+        <option value="hot">Hot (thermal)</option>
+        <option value="greys">Greys</option>
+      </select>
+    </div>
+
+    <div class="control-group">
+      <label>Opacity <span id="opacity-val">75%</span></label>
+      <input type="range" id="opacity-slider" min="0" max="1" step="0.05" value="0.75" />
+    </div>
+
+    <div id="btn-group">
+      <button id="load-btn" disabled>Load data</button>
+      <button id="focus-btn" class="secondary" disabled>Load focus area</button>
+    </div>
+
+    <div id="status-box">Select a source and variable.</div>
+
+    <div id="legend" class="hidden">
+      <div id="legend-title"></div>
+      <div id="legend-bar"></div>
+      <div id="legend-labels">
+        <span id="legend-min"></span>
+        <span id="legend-max"></span>
+      </div>
+    </div>
+
+    <div id="sidebar-footer">
+      <a href="/api/docs" target="_blank">API docs</a>
+    </div>
+  </aside>
+
+  <div id="map"></div>
+  <div id="tooltip" class="hidden"></div>
+
+  <script src="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

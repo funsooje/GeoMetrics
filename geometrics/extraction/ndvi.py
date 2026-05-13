@@ -56,7 +56,7 @@ def submit_ndvi(
     file_prefix: filename without extension, e.g. "batch_001".
     Returns the local job_id.
     """
-    source_id = ensure_source(
+    source_id, _ = ensure_source(
         engine=engine,
         name=_SOURCE_NAME,
         native_level=_NATIVE_LEVEL,
@@ -72,12 +72,13 @@ def submit_ndvi(
     date_start = min(item["date_start"] for item in items)
     date_end = max(item["date_end"] for item in items)
 
+    var_names = [v["name"] for v in _VARIABLE_DEFS]
     task_id = submit_export(
         collection=processed,
         description=f"GeoMetrics Landsat NDVI {file_prefix}",
         folder=gdrive_folder,
         file_prefix=file_prefix,
-        properties=["cell_id", "variable_name", "timestamp", "value"],
+        properties=["cell_id", "timestamp", "source"] + var_names,
     )
 
     return record_submitted(
@@ -139,7 +140,7 @@ def _process_feature(feature):
         bestEffort=True,
     )
 
-    return feature.set({"variable_name": "Landsat_NDVI:NDVI", "value": result.get("NDVI")})
+    return feature.set({"source": _SOURCE_NAME, "NDVI": result.get("NDVI")})
 
 
 def _mask_clouds(image):

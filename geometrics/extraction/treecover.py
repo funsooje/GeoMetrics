@@ -1,43 +1,73 @@
 """
-MODIS MOD44B annual percent tree cover extraction.
+MODIS MOD44B annual tree cover extraction.
 
 Each submitted feature carries start_date and end_date as properties.
 GEE reads those per-feature at runtime, so different cells can cover
 different years within one batch.
 
-Output CSV columns: cell_id, variable_name, timestamp, value
+GEE bands extracted:
+  Percent_Tree_Cover, Percent_NonTree_Vegetation, Percent_NonVegetated,
+  Quality, Percent_Tree_Cover_SD, Percent_NonVegetated_SD, Cloud
 """
 
 from __future__ import annotations
+
+from sqlalchemy.engine import Engine
 
 from geometrics.backends.base import GridBackend
 from geometrics.config import GeoMetricsConfig
 from geometrics.extraction.base import ensure_source, items_to_ee_feature_collection, submit_export
 from geometrics.store.jobs import record_submitted
-from sqlalchemy.engine import Engine
 
 _SOURCE_NAME = "MODIS_Treecover"
-_NATIVE_LEVEL = 11
+_NATIVE_LEVEL = 12
 _PIXEL_RESOLUTION_M = 250
 _COLLECTION = "MODIS/061/MOD44B"
-_GDRIVE_FOLDER = "geometrics_treecover"
 
-_VARIABLE_DEFS = [{"name": "percent_tree_cover", "unit": "percent"}]
+# GEE band name → output variable name
+_BAND_MAP = {
+    "Percent_Tree_Cover": "percent_tree_cover",
+    "Percent_NonTree_Vegetation": "percent_nontree_vegetation",
+    "Percent_NonVegetated": "percent_nonvegetated",
+    "Quality": "quality",
+    "Percent_Tree_Cover_SD": "percent_tree_cover_sd",
+    "Percent_NonVegetated_SD": "percent_nonvegetated_sd",
+    "Cloud": "cloud",
+}
+
+_VARIABLE_DEFS = [
+    {"name": "percent_tree_cover", "unit": "percent"},
+    {"name": "percent_nontree_vegetation", "unit": "percent"},
+    {"name": "percent_nonvegetated", "unit": "percent"},
+    {"name": "quality", "unit": "flag"},
+    {"name": "percent_tree_cover_sd", "unit": "percent"},
+    {"name": "percent_nonvegetated_sd", "unit": "percent"},
+    {"name": "cloud", "unit": "percent"},
+]
 
 SOURCE_SPEC = {
     "name": _SOURCE_NAME,
-    "description": "MODIS MOD44B annual percent tree cover",
+    "description": "MODIS MOD44B annual vegetation continuous fields (250 m)",
     "gee_collection": _COLLECTION,
     "pixel_resolution_m": _PIXEL_RESOLUTION_M,
     "native_level": _NATIVE_LEVEL,
     "source_temporal_granularity": "year",
     "temporal_granularity": "year",
     "variables": [
-        {
-            "name": "percent_tree_cover",
-            "unit": "percent",
-            "description": "Annual percent tree cover (0–100)",
-        },
+        {"name": "percent_tree_cover", "unit": "percent",
+         "description": "Annual percent tree cover (0–100)"},
+        {"name": "percent_nontree_vegetation", "unit": "percent",
+         "description": "Annual percent non-tree vegetation (0–100)"},
+        {"name": "percent_nonvegetated", "unit": "percent",
+         "description": "Annual percent non-vegetated (0–100)"},
+        {"name": "quality", "unit": "flag",
+         "description": "Quality flag"},
+        {"name": "percent_tree_cover_sd", "unit": "percent",
+         "description": "Standard deviation of percent tree cover"},
+        {"name": "percent_nonvegetated_sd", "unit": "percent",
+         "description": "Standard deviation of percent non-vegetated"},
+        {"name": "cloud", "unit": "percent",
+         "description": "Cloud cover percentage"},
     ],
 }
 
@@ -53,11 +83,9 @@ def submit_treecover(
     """
     Submit one GEE batch job for a batch of missing MODIS treecover items.
 
-    gdrive_folder: Drive folder for this batch (caller sets subfolder per source).
-    file_prefix: filename without extension, e.g. "batch_001".
     Returns the local job_id.
     """
-    source_id = ensure_source(
+    source_id, _ = ensure_source(
         engine=engine,
         name=_SOURCE_NAME,
         native_level=_NATIVE_LEVEL,
@@ -73,12 +101,13 @@ def submit_treecover(
     date_start = min(item["date_start"] for item in items)
     date_end = max(item["date_end"] for item in items)
 
+    var_names = [v["name"] for v in _VARIABLE_DEFS]
     task_id = submit_export(
         collection=processed,
         description=f"GeoMetrics Treecover {file_prefix}",
         folder=gdrive_folder,
         file_prefix=file_prefix,
-        properties=["cell_id", "variable_name", "timestamp", "value"],
+        properties=["cell_id", "timestamp", "source"] + var_names,
     )
 
     return record_submitted(
@@ -104,7 +133,7 @@ def _process_feature(feature):
     image = (
         ee.ImageCollection(_COLLECTION)
         .filter(ee.Filter.calendarRange(year, year, "year"))
-        .select("Percent_Tree_Cover")
+        .select(list(_BAND_MAP.keys()))
         .first()
     )
 
@@ -116,7 +145,8 @@ def _process_feature(feature):
         bestEffort=True,
     )
 
-    return feature.set({
-        "variable_name": "MODIS_Treecover:percent_tree_cover",
-        "value": result.get("Percent_Tree_Cover"),
-    })
+    props = {"source": _SOURCE_NAME}
+    for band, var in _BAND_MAP.items():
+        props[var] = result.get(band)
+
+    return feature.set(props)

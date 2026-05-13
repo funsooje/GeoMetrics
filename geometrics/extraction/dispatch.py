@@ -8,14 +8,25 @@ Folder structure: gdrive_folder/SourceName/batch_001.csv, batch_002.csv, ...
 """
 
 from __future__ import annotations
+import calendar
 import math
 
+from geometrics.extraction.era5_land import submit_era5_land
+from geometrics.extraction.modis_ndvi import submit_modis_ndvi
 from geometrics.extraction.ndvi import submit_ndvi
 from geometrics.extraction.treecover import submit_treecover
+from geometrics.extraction.nlcd import submit_nlcd
+from geometrics.extraction.uhi import submit_uhi
+from geometrics.extraction.water import submit_water
 
 SUBMITTERS = {
     "Landsat_NDVI": submit_ndvi,
+    "MODIS_NDVI": submit_modis_ndvi,
     "MODIS_Treecover": submit_treecover,
+    "ERA5_Land": submit_era5_land,
+    "JRC_Water": submit_water,
+    "YALE_UHI": submit_uhi,
+    "NLCD": submit_nlcd,
 }
 
 DEFAULT_BATCH_SIZE = 1000
@@ -28,9 +39,11 @@ def _date_range(resolved_timestamp: str, temporal_granularity: str) -> tuple[str
     if temporal_granularity == "year":
         return f"{year}-01-01", f"{year}-12-31"
     if temporal_granularity == "month":
-        import calendar
         last_day = calendar.monthrange(int(year), int(month))[1]
         return f"{year}-{month}-01", f"{year}-{month}-{last_day:02d}"
+    if temporal_granularity == "hour":
+        hour = resolved_timestamp[:13]  # "YYYY-MM-DDTHH"
+        return hour, hour
     day = resolved_timestamp[:10]
     return day, day
 

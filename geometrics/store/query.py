@@ -14,12 +14,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import pandas as pd
-from sqlalchemy import select
+from sqlalchemy import inspect as sa_inspect, select, text
 from sqlalchemy.engine import Engine
 
 from geometrics.backends.base import GridBackend
-from geometrics.store.schema import observations, sources
-from geometrics.store.schema import variables as variables_table
+from geometrics.catalog import CATALOG
+from geometrics.store.schema import (
+    cells as cells_table,
+    source_table_name,
+    sources,
+    variables as variables_table,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -28,6 +33,8 @@ from geometrics.store.schema import variables as variables_table
 
 @dataclass
 class VariableSpec:
+    """A source + variable pair, optionally at a specific grid level."""
+
     source: str       # matches sources.name, e.g. "Landsat8_NDVI"
     parameter: str    # matches variables.name, e.g. "NDVI"
     level: int | None = None  # None → use source's native_level
@@ -46,6 +53,8 @@ class VariableSpec:
 
 @dataclass
 class DataQuery:
+    """A set of locations and variables to query."""
+
     rows: list[tuple[float, float, str]]  # [(lat, lon, timestamp), ...]
     variables: list[VariableSpec]
 
@@ -82,7 +91,8 @@ def resolve(engine: Engine, backend: GridBackend, query: DataQuery) -> list[dict
                 "temporal_granularity": meta["temporal_granularity"],
                 "requested_level": level,
                 "native_level": meta["native_level"],
-                "variable_id": meta["variable_ids"].get(var_spec.parameter),
+                "known_variables": meta["known_variables"],
+                "table_exists": meta["table_exists"],
             })
     return items
 
@@ -97,8 +107,12 @@ def check_availability(engine: Engine, backend: GridBackend, resolved_items: lis
     available, missing = [], []
 
     for item in resolved_items:
-        if item["variable_id"] is None:
+        if item["parameter"] not in item["known_variables"]:
             missing.append({**item, "reason": "unknown variable"})
+            continue
+
+        if not item["table_exists"]:
+            missing.append({**item, "reason": "not in store"})
             continue
 
         requested_level = item["requested_level"]
@@ -114,7 +128,7 @@ def check_availability(engine: Engine, backend: GridBackend, resolved_items: lis
             else _get_descendants(backend, item["cell_id"], native_level)
         )
 
-        if _has_data(engine, cell_ids_to_check, item["variable_id"], item["timestamp"]):
+        if _has_data(engine, cell_ids_to_check, item["source"], item["timestamp"]):
             available.append(item)
         else:
             missing.append({**item, "reason": "not in store"})
@@ -131,27 +145,31 @@ def fetch(engine: Engine, backend: GridBackend, resolved_items: list[dict]) -> p
     - Finer than native     → NaN (cannot synthesise finer data than stored).
 
     Returns a DataFrame with columns:
-      lat, lon, cell_id, source, parameter, timestamp, value, level, aggregated
+      lat, lon, timestamp, resolved_timestamp, source, parameter, value,
+      cell_id, level, aggregated, _has_record
     """
     rows = []
     for item in resolved_items:
-        if item["variable_id"] is None:
-            rows.append(_make_row(item, value=None, aggregated=False))
+        if item["parameter"] not in item["known_variables"] or not item["table_exists"]:
+            rows.append(_make_row(item, value=None, aggregated=False, has_record=False))
             continue
 
         requested_level = item["requested_level"]
         native_level = item["native_level"]
 
         if requested_level > native_level:
-            rows.append(_make_row(item, value=None, aggregated=False))
+            rows.append(_make_row(item, value=None, aggregated=False, has_record=False))
         elif requested_level == native_level:
-            value = _lookup_single(engine, item["cell_id"], item["variable_id"], item["timestamp"])
-            rows.append(_make_row(item, value=value, aggregated=False))
+            found, value = _lookup_single(
+                engine, item["cell_id"], item["source"], item["parameter"], item["timestamp"]
+            )
+            rows.append(_make_row(item, value=value, aggregated=False, has_record=found))
         else:
             descendants = _get_descendants(backend, item["cell_id"], native_level)
-            values = _lookup_many(engine, descendants, item["variable_id"], item["timestamp"])
-            value = sum(values) / len(values) if values else None
-            rows.append(_make_row(item, value=value, aggregated=True))
+            found, value = _lookup_many(
+                engine, descendants, item["source"], item["parameter"], item["timestamp"]
+            )
+            rows.append(_make_row(item, value=value, aggregated=True, has_record=found))
 
     return pd.DataFrame(rows)
 
@@ -159,6 +177,19 @@ def fetch(engine: Engine, backend: GridBackend, resolved_items: list[dict]) -> p
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+def _resolve_cell_pks(engine: Engine, cell_ids: list[str]) -> dict[str, int]:
+    """Return {cell_id: cell_pk} for all known cell_ids."""
+    if not cell_ids:
+        return {}
+    with engine.connect() as conn:
+        rows = conn.execute(
+            select(cells_table.c.id, cells_table.c.cell_id).where(
+                cells_table.c.cell_id.in_(cell_ids)
+            )
+        ).fetchall()
+    return {r.cell_id: r.id for r in rows}
+
 
 def _load_source_meta(engine: Engine, source_names: list[str]) -> dict[str, dict]:
     unique_names = list(dict.fromkeys(source_names))
@@ -169,29 +200,38 @@ def _load_source_meta(engine: Engine, source_names: list[str]) -> dict[str, dict
 
         unknown = set(unique_names) - {r.name for r in src_rows}
         if unknown:
-            raise ValueError(f"Unknown source(s): {unknown}. Register them before querying.")
+            unregistered = sorted(unknown & set(CATALOG))
+            truly_unknown = sorted(unknown - set(CATALOG))
+            parts = []
+            if unregistered:
+                parts.append(
+                    f"Known but unregistered source(s): {unregistered}. "
+                    "Run gm.register_sources() to add them to the database."
+                )
+            if truly_unknown:
+                parts.append(f"Unknown source(s) (not in catalog): {truly_unknown}.")
+            raise ValueError(" ".join(parts))
 
-        source_ids = {r.name: r.source_id for r in src_rows}
-        native_levels = {r.name: r.native_level for r in src_rows}
-        temporal_granularities = {r.name: r.temporal_granularity for r in src_rows}
-
+        src_meta = {r.name: r for r in src_rows}
         var_rows = conn.execute(
             select(variables_table).where(
-                variables_table.c.source_id.in_(source_ids.values())
+                variables_table.c.source_id.in_([r.source_id for r in src_rows])
             )
         ).fetchall()
 
-    source_id_to_name = {sid: name for name, sid in source_ids.items()}
-    var_by_source: dict[str, dict[str, int]] = {name: {} for name in unique_names}
+    id_to_name = {r.source_id: r.name for r in src_rows}
+    var_by_source: dict[str, set[str]] = {name: set() for name in unique_names}
     for var in var_rows:
-        src_name = source_id_to_name[var.source_id]
-        var_by_source[src_name][var.name] = var.variable_id
+        var_by_source[id_to_name[var.source_id]].add(var.name)
+
+    existing_tables = set(sa_inspect(engine).get_table_names())
 
     return {
         name: {
-            "native_level": native_levels[name],
-            "temporal_granularity": temporal_granularities[name],
-            "variable_ids": var_by_source[name],
+            "native_level": src_meta[name].native_level,
+            "temporal_granularity": src_meta[name].temporal_granularity,
+            "known_variables": var_by_source[name],
+            "table_exists": source_table_name(name) in existing_tables,
         }
         for name in unique_names
     }
@@ -199,15 +239,17 @@ def _load_source_meta(engine: Engine, source_names: list[str]) -> dict[str, dict
 
 def _snap_timestamp(timestamp: str, granularity: str) -> str:
     """Truncate a timestamp string to the variable's storage granularity."""
-    # timestamps are ISO strings: YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS
     date_part = timestamp[:10]  # YYYY-MM-DD
     year, month, _ = date_part.split("-")
     if granularity == "year":
         return f"{year}-01-01"
     if granularity == "month":
         return f"{year}-{month}-01"
-    # day, hour, or finer → return date portion as-is
-    return date_part
+    if granularity == "day":
+        return date_part
+    if granularity == "hour":
+        return timestamp[:13].replace("T", " ") + ":00:00"  # YYYY-MM-DD HH:00:00
+    raise ValueError(f"Unsupported temporal_granularity: {granularity!r}")
 
 
 def _get_descendants(backend: GridBackend, cell_id: str, target_level: int) -> list[str]:
@@ -222,46 +264,87 @@ def _get_descendants(backend: GridBackend, cell_id: str, target_level: int) -> l
     return result
 
 
-def _has_data(engine: Engine, cell_ids: list[str], variable_id: int, timestamp: str) -> bool:
+def _has_data(engine: Engine, cell_ids: list[str], source_name: str, timestamp: str) -> bool:
+    pk_map = _resolve_cell_pks(engine, cell_ids)
+    if not pk_map:
+        return False
+    table = source_table_name(source_name)
+    pks = ", ".join(str(pk) for pk in pk_map.values())
     with engine.connect() as conn:
-        row = conn.execute(
-            select(observations.c.cell_id).where(
-                observations.c.cell_id.in_(cell_ids),
-                observations.c.variable_id == variable_id,
-                observations.c.timestamp == timestamp,
-            ).limit(1)
-        ).fetchone()
+        row = conn.execute(text(f"""
+            SELECT 1 FROM spatiotemporal_units u
+            JOIN {table} o ON o.unit_pk = u.id
+            WHERE u.cell_pk IN ({pks}) AND u.timestamp = :ts
+            LIMIT 1
+        """), {"ts": timestamp}).fetchone()
     return row is not None
 
 
-def _lookup_single(engine: Engine, cell_id: str, variable_id: int, timestamp: str) -> float | None:
+def _lookup_single(
+    engine: Engine, cell_id: str, source_name: str, parameter: str, timestamp: str
+) -> tuple[bool, float | None]:
+    pk_map = _resolve_cell_pks(engine, [cell_id])
+    if not pk_map:
+        return False, None
+    table = source_table_name(source_name)
     with engine.connect() as conn:
-        row = conn.execute(
-            select(observations.c.value).where(
-                observations.c.cell_id == cell_id,
-                observations.c.variable_id == variable_id,
-                observations.c.timestamp == timestamp,
-            )
-        ).fetchone()
-    return row.value if row else None
+        row = conn.execute(text(f"""
+            SELECT o.{parameter}
+            FROM spatiotemporal_units u
+            JOIN {table} o ON o.unit_pk = u.id
+            WHERE u.cell_pk = :pk AND u.timestamp = :ts
+        """), {"pk": pk_map[cell_id], "ts": timestamp}).fetchone()
+    if row is None:
+        return False, None
+    return True, row[0]
 
 
 def _lookup_many(
-    engine: Engine, cell_ids: list[str], variable_id: int, timestamp: str
-) -> list[float]:
+    engine: Engine,
+    cell_ids: list[str],
+    source_name: str,
+    parameter: str,
+    timestamp: str,
+) -> tuple[bool, float | None]:
+    pk_map = _resolve_cell_pks(engine, cell_ids)
+    if not pk_map:
+        return False, None
+    table = source_table_name(source_name)
+    pks = ", ".join(str(pk) for pk in pk_map.values())
     with engine.connect() as conn:
-        rows = conn.execute(
-            select(observations.c.value).where(
-                observations.c.cell_id.in_(cell_ids),
-                observations.c.variable_id == variable_id,
-                observations.c.timestamp == timestamp,
-                observations.c.value.is_not(None),
-            )
-        ).fetchall()
-    return [r.value for r in rows]
+        rows = conn.execute(text(f"""
+            SELECT o.{parameter}
+            FROM spatiotemporal_units u
+            JOIN {table} o ON o.unit_pk = u.id
+            WHERE u.cell_pk IN ({pks}) AND u.timestamp = :ts
+        """), {"ts": timestamp}).fetchall()
+    if not rows:
+        return False, None
+    values = [r[0] for r in rows if r[0] is not None]
+    return True, (sum(values) / len(values) if values else None)
 
 
-def _make_row(item: dict, value: float | None, aggregated: bool) -> dict:
+def clear_observations(engine: Engine, source_name: str) -> None:
+    """
+    Drop the observation table for a source.
+
+    Leaves source and variable registrations intact so corrected data can be
+    re-ingested without re-running init_db. Raises ValueError if the source
+    is not registered.
+    """
+    with engine.connect() as conn:
+        src_row = conn.execute(
+            select(sources.c.source_id).where(sources.c.name == source_name)
+        ).fetchone()
+    if src_row is None:
+        raise ValueError(f"Source {source_name!r} not found in database.")
+
+    table = source_table_name(source_name)
+    with engine.begin() as conn:
+        conn.execute(text(f"DROP TABLE IF EXISTS {table} CASCADE"))
+
+
+def _make_row(item: dict, value: float | None, aggregated: bool, has_record: bool) -> dict:
     return {
         "lat": item["lat"],
         "lon": item["lon"],
@@ -273,4 +356,5 @@ def _make_row(item: dict, value: float | None, aggregated: bool) -> dict:
         "cell_id": item["cell_id"],
         "level": item["requested_level"],
         "aggregated": aggregated,
+        "_has_record": has_record,
     }

@@ -1,13 +1,14 @@
 """
-Ingest GEE-exported CSVs into the observations table.
+Ingest GEE-exported CSVs into per-source wide observation tables.
 
-Expected CSV columns (produced by extraction modules):
+Expected CSV columns:
   cell_id        - backend cell ID string
-  variable_name  - "SourceName:variable" e.g. "Landsat_NDVI:NDVI"
+  source         - source name, e.g. "Landsat_NDVI"
   timestamp      - ISO date/datetime string
-  value          - float
+  <variable cols> - one column per variable, e.g. NDVI
 
 GEE also adds 'system:index' and '.geo' columns; these are silently dropped.
+The obs table for each source is created on first ingest if it does not exist.
 """
 
 from __future__ import annotations
@@ -15,22 +16,43 @@ from __future__ import annotations
 from pathlib import Path
 
 import pandas as pd
-from sqlalchemy import select
+from sqlalchemy import select, text
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import Engine
 
-from geometrics.store.schema import observations, sources, variables
+from geometrics.store.query import _snap_timestamp
+from geometrics.store.schema import (
+    cells,
+    ensure_source_obs_table,
+    ensure_spatiotemporal_year_partitions,
+    hiergp_cells,
+    source_table_name,
+    sources,
+    spatiotemporal_units,
+    variables,
+)
 
 _GEE_META_COLS = {"system:index", ".geo"}
-_REQUIRED_COLS = {"cell_id", "variable_name", "timestamp", "value"}
+_FIXED_COLS = {"cell_id", "timestamp", "source"}
 
 
-def ingest_folder(engine: Engine, folder_path: str | Path) -> dict:
+def ingest_file(engine: Engine, path: str | Path, backend_name: str = "hiergp") -> int:
+    """Ingest a single GEE-exported CSV. Returns total rows inserted."""
+    path = Path(path)
+    print(f"Ingesting {path.name} …")
+    data = _read_csv(path)
+    total = 0
+    for source_name, group in data.groupby("source"):
+        total += _ingest_group(engine, group, str(source_name), backend_name)
+    return total
+
+
+def ingest_folder(
+    engine: Engine, folder_path: str | Path, backend_name: str = "hiergp"
+) -> dict:
     """
-    Ingest all GEE-exported CSVs found in folder_path into observations.
-
-    Scans for *.csv files, reads each one, resolves variable_id from the
-    "SourceName:variable" format in the variable_name column, and inserts
-    rows. Duplicates are silently skipped.
+    Ingest all GEE-exported CSVs found in folder_path.
 
     Returns {filename: rows_inserted} for every file processed.
     """
@@ -47,94 +69,235 @@ def ingest_folder(engine: Engine, folder_path: str | Path) -> dict:
     for path in csv_files:
         print(f"Ingesting {path.name} …")
         data = _read_csv(path)
-        var_map = _build_variable_map(engine, data["variable_name"].unique().tolist())
-        data["variable_id"] = data["variable_name"].map(var_map)
-
-        rows = [
-            {
-                "cell_id": row.cell_id,
-                "variable_id": int(row.variable_id),
-                "timestamp": row.timestamp,
-                "value": row.value if pd.notna(row.value) else None,
-            }
-            for row in data.itertuples(index=False)
-        ]
-
-        inserted = _insert_ignore(engine, rows)
-        skipped = len(rows) - inserted
-        print(f"  {path.name}: inserted {inserted} row(s), skipped {skipped} duplicate(s).")
+        inserted = 0
+        for source_name, group in data.groupby("source"):
+            inserted += _ingest_group(engine, group, str(source_name), backend_name)
         results[path.name] = inserted
 
     return results
 
 
-def _read_csv(path: Path) -> pd.DataFrame:
-    data: pd.DataFrame = pd.read_csv(path)
-    data = data.drop(columns=[c for c in _GEE_META_COLS if c in data.columns])
-    missing = _REQUIRED_COLS - set(data.columns)
-    if missing:
-        raise ValueError(f"{path.name}: missing required columns: {missing}")
-    return data[list(_REQUIRED_COLS)]
+# ---------------------------------------------------------------------------
+# Core ingest logic
+# ---------------------------------------------------------------------------
+
+def _ingest_group(
+    engine: Engine, group: pd.DataFrame, source_name: str, backend_name: str
+) -> int:
+    var_cols = [c for c in group.columns if c not in _FIXED_COLS]
+    var_defs, temporal_granularity = _get_source_meta(engine, source_name)
+
+    ensure_source_obs_table(engine, source_name, var_defs)
+
+    # Snap timestamps to the source's granularity so they match query-time lookups
+    group = group.copy()
+    group["timestamp"] = group["timestamp"].apply(
+        lambda ts: _snap_timestamp(str(ts), temporal_granularity)
+    )
+
+    years = {int(ts[:4]) for ts in group["timestamp"]}
+    ensure_spatiotemporal_year_partitions(engine, years)
+
+    pk_map = _ensure_cells(engine, group["cell_id"].tolist(), backend_name)
+    group["cell_pk"] = group["cell_id"].map(pk_map)
+
+    unit_map = _ensure_spatiotemporal_units(engine, group)
+    group["unit_pk"] = group.apply(
+        lambda r: unit_map.get((int(r["cell_pk"]), r["timestamp"])), axis=1
+    )
+
+    inserted = _insert_wide(engine, group, source_name, var_cols)
+    skipped = len(group) - inserted
+    print(f"  {source_name}: inserted {inserted} row(s), skipped {skipped} duplicate(s).")
+    return inserted
 
 
-def _build_variable_map(engine: Engine, qualified_names: list[str]) -> dict[str, int]:
-    """
-    Resolve "SourceName:variable" strings to variable_id.
-
-    Raises ValueError for any name that doesn't match a known source+variable pair.
-    """
-    parsed: dict[str, tuple[str, str]] = {}
-    for qname in qualified_names:
-        if ":" not in qname:
+def _get_source_meta(engine: Engine, source_name: str) -> tuple[list[dict], str]:
+    """Return (variable_defs, temporal_granularity) for a registered source."""
+    with engine.connect() as conn:
+        src_row = conn.execute(
+            select(sources.c.source_id, sources.c.temporal_granularity)
+            .where(sources.c.name == source_name)
+        ).fetchone()
+        if src_row is None:
             raise ValueError(
-                f"variable_name {qname!r} must be in 'SourceName:variable' format."
+                f"Source {source_name!r} not registered. Run gm.register_sources() first."
             )
-        source_name, var_name = qname.split(":", 1)
-        parsed[qname] = (source_name, var_name)
+        var_rows = conn.execute(
+            select(variables.c.name, variables.c.unit).where(
+                variables.c.source_id == src_row.source_id
+            )
+        ).fetchall()
+    var_defs = [{"name": r.name, "unit": r.unit} for r in var_rows]
+    return var_defs, src_row.temporal_granularity
+
+
+def _build_rows(group: pd.DataFrame, var_cols: list[str]) -> list[dict]:
+    rows = []
+    for row in group.itertuples(index=False):
+        entry: dict = {"unit_pk": int(row.unit_pk)}
+        for col in var_cols:
+            val = getattr(row, col)
+            entry[col] = val if pd.notna(val) else None
+        rows.append(entry)
+    return rows
+
+
+def _insert_wide(
+    engine: Engine, group: pd.DataFrame, source_name: str, var_cols: list[str]
+) -> int:
+    table = source_table_name(source_name)
+    cols = ["unit_pk"] + var_cols
+    col_sql = ", ".join(cols)
+    param_sql = ", ".join(f":{c}" for c in cols)
+    if engine.dialect.name == "postgresql":
+        stmt = text(
+            f"INSERT INTO {table} ({col_sql}) VALUES ({param_sql})"
+            " ON CONFLICT (unit_pk) DO NOTHING"
+        )
+    else:
+        stmt = text(f"INSERT OR IGNORE INTO {table} ({col_sql}) VALUES ({param_sql})")
+    with engine.begin() as conn:
+        result = conn.execute(stmt, _build_rows(group, var_cols))
+    return result.rowcount
+
+
+# ---------------------------------------------------------------------------
+# Spatiotemporal unit registration
+# ---------------------------------------------------------------------------
+
+def _ensure_spatiotemporal_units(
+    engine: Engine, group: pd.DataFrame
+) -> dict[tuple[int, str], int]:
+    """
+    Upsert (cell_pk, timestamp) pairs into spatiotemporal_units.
+    Returns {(cell_pk, timestamp_str): unit_pk}.
+    """
+    dialect = engine.dialect.name
+    unit_rows = [
+        {"cell_pk": int(row.cell_pk), "timestamp": str(row.timestamp)}
+        for row in group[["cell_pk", "timestamp"]].drop_duplicates().itertuples(index=False)
+    ]
+
+    with engine.begin() as conn:
+        if dialect == "sqlite":
+            conn.execute(
+                sqlite_insert(spatiotemporal_units)
+                .prefix_with("OR IGNORE")
+                .values(unit_rows)
+            )
+        else:
+            conn.execute(
+                pg_insert(spatiotemporal_units)
+                .on_conflict_do_nothing(index_elements=["cell_pk", "timestamp"])
+                .values(unit_rows)
+            )
+
+    cell_pks = [r["cell_pk"] for r in unit_rows]
+    timestamps = [r["timestamp"] for r in unit_rows]
+    with engine.connect() as conn:
+        if dialect == "postgresql":
+            rows = conn.execute(text("""
+                SELECT id, cell_pk, timestamp
+                FROM spatiotemporal_units
+                WHERE cell_pk = ANY(:pks) AND timestamp = ANY(:tss)
+            """), {"pks": cell_pks, "tss": timestamps}).fetchall()
+        else:
+            pks_sql = ",".join(str(p) for p in cell_pks)
+            tss_sql = ",".join(f"'{t}'" for t in timestamps)
+            rows = conn.execute(text(f"""
+                SELECT id, cell_pk, timestamp
+                FROM spatiotemporal_units
+                WHERE cell_pk IN ({pks_sql}) AND timestamp IN ({tss_sql})
+            """)).fetchall()
+    return {(r.cell_pk, str(r.timestamp)): r.id for r in rows}
+
+
+# ---------------------------------------------------------------------------
+# Cell registration
+# ---------------------------------------------------------------------------
+
+def _cell_level(cell_id: str, backend_name: str) -> int:
+    if backend_name == "hiergp":
+        return int(cell_id.split(":")[0])
+    if backend_name == "h3":
+        import h3  # pylint: disable=import-outside-toplevel,import-error
+        return h3.get_resolution(cell_id)
+    raise ValueError(f"Unknown backend: {backend_name!r}")
+
+
+def _parse_hiergp_xy(cell_id: str) -> tuple[int, int]:
+    _, coords = cell_id.split(":")
+    coord_x, coord_y = coords.split("|")
+    return int(coord_x), int(coord_y)
+
+
+def _ensure_hiergp_cells(
+    engine: Engine, hiergp_rows: list[dict], pk_map: dict[str, int], dialect: str
+) -> None:
+    hgp_rows = [
+        {"cell_pk": pk_map[r["cell_id"]], "x": r["x"], "y": r["y"]}
+        for r in hiergp_rows
+        if r["cell_id"] in pk_map
+    ]
+    with engine.begin() as conn:
+        if dialect == "sqlite":
+            conn.execute(sqlite_insert(hiergp_cells).prefix_with("OR IGNORE"), hgp_rows)
+        else:
+            conn.execute(
+                pg_insert(hiergp_cells).on_conflict_do_nothing(index_elements=["cell_pk"]),
+                hgp_rows,
+            )
+
+
+def _ensure_cells(
+    engine: Engine, cell_ids: list[str], backend_name: str
+) -> dict[str, int]:
+    """Upsert cell_ids into the cells table. Returns {cell_id: cell_pk}."""
+    unique_ids = list(dict.fromkeys(cell_ids))
+    dialect = engine.dialect.name
+
+    cell_rows, hiergp_rows = [], []
+    for cid in unique_ids:
+        level = _cell_level(cid, backend_name)
+        cell_rows.append({"cell_id": cid, "backend": backend_name, "level": level})
+        if backend_name == "hiergp":
+            coord_x, coord_y = _parse_hiergp_xy(cid)
+            hiergp_rows.append({"cell_id": cid, "x": coord_x, "y": coord_y})
+
+    with engine.begin() as conn:
+        if dialect == "sqlite":
+            conn.execute(sqlite_insert(cells).prefix_with("OR IGNORE"), cell_rows)
+        else:
+            conn.execute(
+                pg_insert(cells).on_conflict_do_nothing(index_elements=["cell_id"]),
+                cell_rows,
+            )
 
     with engine.connect() as conn:
         rows = conn.execute(
-            select(
-                sources.c.name.label("source_name"),
-                variables.c.name.label("var_name"),
-                variables.c.variable_id,
-            ).join(variables, sources.c.source_id == variables.c.source_id)
+            select(cells.c.id, cells.c.cell_id).where(cells.c.cell_id.in_(unique_ids))
         ).fetchall()
+    pk_map = {r.cell_id: r.id for r in rows}
 
-    lookup = {(r.source_name, r.var_name): r.variable_id for r in rows}
+    if backend_name == "hiergp" and hiergp_rows:
+        _ensure_hiergp_cells(engine, hiergp_rows, pk_map, dialect)
 
-    result: dict[str, int] = {}
-    unknown = []
-    for qname, (src, var) in parsed.items():
-        vid = lookup.get((src, var))
-        if vid is None:
-            unknown.append(qname)
-        else:
-            result[qname] = vid
-
-    if unknown:
-        raise ValueError(
-            f"Unknown source:variable pair(s): {unknown}. "
-            "Run gm.register_sources() if the source has not been registered."
-        )
-    return result
+    return pk_map
 
 
-def _insert_ignore(engine: Engine, rows: list[dict]) -> int:
-    if not rows:
-        return 0
-    dialect = engine.dialect.name
-    with engine.begin() as conn:
-        if dialect == "sqlite":
-            from sqlalchemy.dialects.sqlite import insert
-            stmt = insert(observations).prefix_with("OR IGNORE")
-        elif dialect == "postgresql":
-            from sqlalchemy.dialects.postgresql import insert
-            stmt = insert(observations).on_conflict_do_nothing(
-                index_elements=["cell_id", "variable_id", "timestamp"]
-            )
-        else:
-            from sqlalchemy import insert
-            stmt = insert(observations)
-        result = conn.execute(stmt, rows)
-        return result.rowcount
+# ---------------------------------------------------------------------------
+# CSV parsing
+# ---------------------------------------------------------------------------
+
+def _read_csv(path: Path) -> pd.DataFrame:
+    data = pd.DataFrame(pd.read_csv(path))
+    data = data.drop(columns=[c for c in _GEE_META_COLS if c in data.columns])
+    missing = _FIXED_COLS - set(data.columns)
+    if missing:
+        raise ValueError(f"{path.name}: missing required columns: {missing}")
+    var_cols = [c for c in data.columns if c not in _FIXED_COLS]
+    if not var_cols:
+        raise ValueError(f"{path.name}: no variable columns found.")
+    data["timestamp"] = pd.to_datetime(data["timestamp"])
+    return data
